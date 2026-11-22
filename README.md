@@ -9,12 +9,19 @@ exactly as the reference does on every input — `{columns, rows, errors}` —
 including its broken-row policy (stray CRs, quote junk, unterminated quotes,
 short and long rows), and `main.ts` is the driver the harness runs.
 
-How it gets faster: most records are read at line level — one regex scan
-finds the next line break, quote or CR, and a clean line is split in one go
-instead of walking it character by character. Quoted fields jump from quote
-to quote with `indexOf`, and only the rare multiline / doubled-quote
-segments go through the careful per-field parser, which mirrors the
-reference rule for rule.
+How it gets faster (v2): the hot path has no regex and allocates no object
+per field. The line probe uses cached `indexOf` scans (each delimiter class
+is swept once over the text in C++), clean lines are split in one go,
+unquoted fields scan with a tight `charCodeAt` loop, and quoted fields jump
+from quote to quote with `indexOf`; only multiline / doubled-quote segments
+go through a slow path. The field readers report through shared slots
+instead of a fresh object per field. The driver stringifies each case's
+columns / rows / errors arrays on their own (byte-identical to one
+`JSON.stringify` of the whole answers array, but faster), and it keeps
+TurboFan off (`--no-turbofan`): for a single-shot run, Maglev's quick
+mid-tier code beats paying TurboFan's ~35 ms compile per hot function plus
+its deopt/reopt churn. The careful per-field parser mirrors the reference
+rule for rule, so broken rows come out identical.
 
 ## Layout
 
