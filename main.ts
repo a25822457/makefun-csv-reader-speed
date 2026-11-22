@@ -42,14 +42,16 @@ try {
     throw new Error("wasm process failed, debug=" + (exp.debugCode() as number));
   }
   const outPtr = exp.outputPtr() as number;
-  out = Buffer.from(new Uint8Array(mem.buffer, outPtr, outLen));
+  // Write the WASM memory view directly: no extra 12 MB Buffer copy.
+  const outView = new Uint8Array(mem.buffer, outPtr, outLen);
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(OUTPUT, outView);
 } catch {
   // Fallback: the correct JS implementation in solve.js.
   const { run } = (await import("./solve.js")) as any;
   const cases = JSON.parse(input.toString("utf8"));
   const answers = cases.map((c: any) => run(c.input));
   out = Buffer.from(JSON.stringify(answers), "utf8");
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(OUTPUT, out);
 }
-
-fs.mkdirSync(outDir, { recursive: true });
-fs.writeFileSync(OUTPUT, out);

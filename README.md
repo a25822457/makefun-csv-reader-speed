@@ -24,19 +24,23 @@ memory:
    fields with doubled quotes, CRLF/lone-CR inside quotes read as LF,
    `quote_junk`, unterminated-quote re-read as unquoted, `short_row` /
    `long_row` pad/cut. Delimiter scans use 128-bit SIMD masked loads.
+   Parse and emit are fused: each field is written to the output as
+   soon as it is read (no per-field descriptor round-trip); only a
+   long row's extra fields are kept, for the error's `extra` array.
 3. **JSON emit** — writes `answers.json` bytes directly with
    `JSON.stringify`-identical escaping. A per-field flag (set during
    parsing) lets the emitter skip the escape scan for the ~95% of
    fields that need none.
 
 `main.ts` copies `/input/cases.json` into WASM memory, calls
-`process()`, and writes the returned bytes to `/output/answers.json`.
+`process()`, and writes the returned bytes to `/output/answers.json`
+(the WASM memory view is written directly, with no extra copy).
 If the WASM path fails, it falls back to `solve.js`.
 
 ## Files
 
 - `main.ts` — entrypoint (Node 22), drives the WASM transducer.
-- `parser.wasm` — the compiled transducer (12,083 bytes).
+- `parser.wasm` — the compiled transducer (7,419 bytes).
 - `transducer.ts` — the AssemblyScript source.
 - `solve.js` — the correct dependency-free JS drop-in for
   csv-reader 1.0.0 (also the fallback `run({text, header})`).
@@ -44,7 +48,8 @@ If the WASM path fails, it falls back to `solve.js`.
 ## Verification (local)
 
 - Practice set: 6/6 cases match the reference, byte-identical across
-  runs, ~53 ms (v2 JS: 1,460 ms on the dev server).
+  runs, ~72 ms warm for `process()` alone (v3: ~93 ms; v2 JS: 1,460 ms
+  on the dev server).
 - Differential fuzz vs csv-reader 1.0.0: 6,000/6,000 random +
   broken-CSV cases match (unterminated quotes, junk after closing
   quotes, doubled quotes, embedded CR/LF/CRLF, stray CRs, short/long

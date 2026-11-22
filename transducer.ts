@@ -69,6 +69,12 @@ let fEnded: i32 = 0; // 0=COMMA, 1=LINE_BREAK, 2=END
 let fAdded: i32 = 0;
 let fNeedsEscape: bool = false;
 
+// Fused parse+emit: the current record is the case's first record
+// (width not yet known), and the first field's value length (for the
+// empty-line check).
+let recFirst: bool = false;
+let firstFieldLen: i32 = 0;
+
 const DESC_BYTES: usize = 4 * 1024 * 1024;
 const DESC_CAP: i32 = 262144; // 4 MiB / 16 bytes per descriptor
 const ERR_BYTES: usize = 12 * 1024 * 1024;
@@ -783,8 +789,10 @@ function emitEscapedTo(s: usize, e: usize, toErr: bool): void {
 
 // ---------- field descriptors ----------
 
-// Descriptor: 16 bytes: start, end, kind (0=text range, 1=scratch), flags
-// (bit 0 = the value needs JSON escaping).
+// Descriptor: 16 bytes: start, end, kind, flags. In the fused design
+// descriptors are kept ONLY for a long row's extra fields (rare); row
+// fields are emitted to the output as they are parsed, so they never
+// touch the descriptor buffer.
 function addDesc(start: usize, end: usize, kind: i32, flags: i32): void {
   if (descCount >= DESC_CAP) {
     failed = true;
@@ -797,11 +805,6 @@ function addDesc(start: usize, end: usize, kind: i32, flags: i32): void {
   store<u32>(d + 8, kind);
   store<u32>(d + 12, flags);
   descCount++;
-}
-
-function descLen(i: i32): i32 {
-  const d = descBuf + <usize>i * 16;
-  return <i32>(load<u32>(d + 4) - load<u32>(d));
 }
 
 function descStart(i: i32): usize {
@@ -855,8 +858,9 @@ function pushShortRow(nfields: i32): void {
 function pushLongRow(): void {
   errOpen('long_row');
   errLit(',"extra":[');
-  for (let i = width; i < fieldCount; i++) {
-    if (i > width) errByte(0x2c);
+  // Descriptors hold only this record's extra fields, in order.
+  for (let i = 0; i < descCount; i++) {
+    if (i > 0) errByte(0x2c);
     errByte(0x22);
     emitEscapedTo(descStart(i), descEnd(i), true);
     errByte(0x22);
@@ -1097,32 +1101,11 @@ function readQuoted(): void {
   }
 }
 
-function parseRecord(): void {
-  descCount = 0;
-  scratchPtr = scratchBuf;
-  recordLine = line;
-  recordRow = headerFlag && !columnsDone ? -1 : rowsEmitted;
-  fieldCount = 0;
-  for (;;) {
-    lastQuoted = load<u8>(tp) == 0x22;
-    if (lastQuoted) readQuoted();
-    else readUnquoted();
-    if (failed) return;
-    addDesc(fStart, fEnd, fKind, fNeedsEscape ? 1 : 0);
-    if (failed) return;
-    fieldCount++;
-    if (fEnded != 0) break;
-  }
-}
-
-// ---------- record emission ----------
-
-function emitStringDesc(i: i32): void {
-  const s = descStart(i);
-  const e = descEnd(i);
+// Emit one field's JSON string ("value", escaped as needed) to the output.
+// Fast path: plain copy with quotes, one bounds check, no per-byte calls.
+function emitFieldOut(s: usize, e: usize, needsEscape: bool): void {
   const len = e - s;
-  if (descFlags(i) == 0) {
-    // Plain copy with quotes, one bounds check, no per-byte calls.
+  if (!needsEscape) {
     if (outPtr + len + 2 > outCap) growOut(len + 2);
     if (failed) return;
     store<u8>(outPtr, 0x22);
@@ -1137,31 +1120,34 @@ function emitStringDesc(i: i32): void {
   }
 }
 
-function emitFields(n: i32): void {
-  outByte(0x5b);
-  for (let i = 0; i < n; i++) {
-    if (i > 0) outByte(0x2c);
-    emitStringDesc(i);
+// Parse one record, emitting each field to the output as it is read
+// (fused parse+emit). Row fields go straight out; fields past the width
+// (long row) are kept as descriptors for the error's extra array, which
+// pushLongRow emits after the record ends (so error order is preserved).
+function parseRecord(): void {
+  descCount = 0;
+  scratchPtr = scratchBuf;
+  recordLine = line;
+  recordRow = headerFlag && !columnsDone ? -1 : rowsEmitted;
+  fieldCount = 0;
+  firstFieldLen = 0;
+  for (;;) {
+    lastQuoted = load<u8>(tp) == 0x22;
+    if (lastQuoted) readQuoted();
+    else readUnquoted();
+    if (failed) return;
+    if (fieldCount == 0) firstFieldLen = <i32>(fEnd - fStart);
+    if (recFirst || fieldCount < width) {
+      if (fieldCount > 0) outByte(0x2c);
+      emitFieldOut(fStart, fEnd, fNeedsEscape);
+      if (failed) return;
+    } else {
+      addDesc(fStart, fEnd, fKind, fNeedsEscape ? 1 : 0);
+      if (failed) return;
+    }
+    fieldCount++;
+    if (fEnded != 0) break;
   }
-  outByte(0x5d);
-}
-
-function emitRow(): void {
-  if (fieldCount < width) pushShortRow(fieldCount);
-  else if (fieldCount > width) pushLongRow();
-  if (failed) return;
-  const n = fieldCount < width ? fieldCount : width;
-  outByte(0x5b);
-  for (let i = 0; i < n; i++) {
-    if (i > 0) outByte(0x2c);
-    emitStringDesc(i);
-  }
-  for (let i = n; i < width; i++) {
-    outByte(0x2c);
-    outByte(0x22);
-    outByte(0x22);
-  }
-  outByte(0x5d);
 }
 
 function processCase(ts: usize, te: usize, header: bool): void {
@@ -1191,26 +1177,46 @@ function processCase(ts: usize, te: usize, header: bool): void {
       } else break;
     }
     if (tp >= tEnd) break;
+    // Rollback point: a record that turns out to be an empty line must
+    // vanish from the output (its opening bracket and field).
+    const savedOut = outPtr;
+    // Open the record's array (retractable via the saved pointers).
+    if (first) {
+      if (header) outByte(0x5b);
+      else outLit('null,"rows":[[');
+    } else {
+      if (rowsEmitted > 0) outByte(0x2c);
+      outByte(0x5b);
+    }
+    recFirst = first;
     parseRecord();
     if (failed) return;
-    if (fieldCount == 1 && !lastQuoted && descLen(0) == 0) continue;
+    if (fieldCount == 1 && !lastQuoted && firstFieldLen == 0) {
+      // Empty line: retract only its output (opening bracket and field).
+      // Its errors (e.g. a trailing lone CR's stray_cr) are kept: the
+      // reference includes them.
+      outPtr = savedOut;
+      continue;
+    }
     if (first) {
       first = false;
       width = fieldCount;
       if (header) {
-        emitFields(fieldCount);
+        outLit('],"rows":[');
         columnsDone = true;
       } else {
-        outLit('null');
-      }
-      outLit(',"rows":[');
-      if (!header) {
-        emitRow();
+        outByte(0x5d);
         rowsEmitted = 1;
       }
     } else {
-      if (rowsEmitted > 0) outByte(0x2c);
-      emitRow();
+      if (fieldCount < width) {
+        pushShortRow(fieldCount);
+        for (let i = fieldCount; i < width; i++) outLit(',""');
+      } else if (fieldCount > width) {
+        pushLongRow();
+      }
+      if (failed) return;
+      outByte(0x5d);
       rowsEmitted++;
     }
     if (failed) return;
