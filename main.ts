@@ -1,52 +1,55 @@
-// Driver for the csv-reader-speed entry: reads every case from the input
-// directory, answers each one alone with run() from solve.js, and writes
-// the answers in order to the output directory as answers.json.
-// Runs on Node 22; the harness mounts /input and /output, and outside a
-// container MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR stand in for them.
+// Driver for the CSV reader entry.
+//
+// The timed path is a byte-level WASM transducer (parser.wasm, compiled
+// from transducer.ts with AssemblyScript): it scans the raw cases.json
+// bytes, unescapes each case's text, runs the csv-reader state machine on
+// bytes, and emits answers.json directly, so it never parses JSON values
+// or allocates per field. If the WASM path fails for any reason, it falls
+// back to solve.js (the correct JS drop-in for csv-reader 1.0.0).
 
-import { readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { setFlagsFromString } from 'node:v8';
+import { setFlagsFromString } from "node:v8";
+import fs from "node:fs";
+import { join } from "node:path";
 
-// Keep V8's incremental marking off for all of solve.js's work, as the
-// house baseline's driver does, and keep TurboFan off too: for a
-// single-shot run like this one, Maglev's quick mid-tier code beats paying
-// TurboFan's ~35 ms compile per hot function plus its deopt/reopt churn.
-// Both flags are set before the import so they apply to solve.js.
-setFlagsFromString('--no-incremental-marking --no-turbofan');
+setFlagsFromString("--no-incremental-marking");
 
-const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as {
-  run: (input: unknown) => { columns: unknown; rows: unknown; errors: unknown };
-};
+// The harness mounts /input and /output on the server; grade-local's
+// process driver points at temp dirs via these env vars instead.
+const inDir = process.env.MAKEFUN_INPUT_DIR ?? "/input";
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+const INPUT = join(inDir, "cases.json");
+const OUTPUT = join(outDir, "answers.json");
 
-const inDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const input = fs.readFileSync(INPUT);
 
-const cases = JSON.parse(readFileSync(join(inDir, 'cases.json'), 'utf8')) as {
-  id: string;
-  input: unknown;
-}[];
+let out: Buffer | null = null;
 
-const answers: { columns: unknown; rows: unknown; errors: unknown }[] = [];
-for (const c of cases) answers.push(run(c.input));
-
-// Serialize per part instead of one JSON.stringify(answers): stringifying
-// each case's columns / rows / errors arrays on their own is markedly
-// faster in V8 than one traversal of the whole nested structure, and the
-// bytes are identical (verified: same string as JSON.stringify(answers)).
-// Key order is fixed by run(), which returns {columns, rows, errors}.
-let out = '[';
-for (let i = 0; i < answers.length; i++) {
-  if (i) out += ',';
-  const a = answers[i];
-  out +=
-    '{"columns":' +
-    JSON.stringify(a.columns) +
-    ',"rows":' +
-    JSON.stringify(a.rows) +
-    ',"errors":' +
-    JSON.stringify(a.errors) +
-    '}';
+try {
+  const wasmBytes = fs.readFileSync(new URL("./parser.wasm", import.meta.url));
+  const { instance } = await WebAssembly.instantiate(wasmBytes, {
+    env: {
+      abort() {
+        throw new Error("wasm abort");
+      },
+    },
+  });
+  const exp = instance.exports as any;
+  const mem = exp.memory as WebAssembly.Memory;
+  const inputPtr = exp.setup(input.length) as number;
+  new Uint8Array(mem.buffer, inputPtr, input.length).set(input);
+  const outLen = exp.process() as number;
+  if (outLen < 0 || (exp.debugCode() as number) !== 0) {
+    throw new Error("wasm process failed, debug=" + (exp.debugCode() as number));
+  }
+  const outPtr = exp.outputPtr() as number;
+  out = Buffer.from(new Uint8Array(mem.buffer, outPtr, outLen));
+} catch {
+  // Fallback: the correct JS implementation in solve.js.
+  const { run } = (await import("./solve.js")) as any;
+  const cases = JSON.parse(input.toString("utf8"));
+  const answers = cases.map((c: any) => run(c.input));
+  out = Buffer.from(JSON.stringify(answers), "utf8");
 }
-out += ']';
-writeFileSync(join(outDir, 'answers.json'), out);
+
+fs.mkdirSync(outDir, { recursive: true });
+fs.writeFileSync(OUTPUT, out);

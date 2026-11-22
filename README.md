@@ -1,38 +1,47 @@
-[![make.fun · csv-reader-speed-01-run-20261121](https://make.fun/badge/csv-reader-speed-01-run-20261121.svg)](https://make.fun/bounty/csv-reader-speed-01-run-20261121?utm_source=github&utm_medium=readme&utm_campaign=csv-reader-speed-01-run-20261121)
-[![rank](https://make.fun/badge/csv-reader-speed-01-run-20261121/a25822457/makefun-csv-reader-speed/rank.svg)](https://make.fun/bounty/csv-reader-speed-01-run-20261121/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=csv-reader-speed-01-run-20261121)
-[![reward](https://make.fun/badge/csv-reader-speed-01-run-20261121/a25822457/makefun-csv-reader-speed/reward.svg)](https://make.fun/bounty/csv-reader-speed-01-run-20261121?utm_source=github&utm_medium=readme&utm_campaign=csv-reader-speed-01-run-20261121)
+# CSV reader speed — WASM entry
 
-# Faster csv-reader
+A byte-level transducer that answers every case exactly the way
+csv-reader 1.0.0 does, but without parsing JSON values or allocating
+per field.
 
-A faster drop-in for make.fun's own csv-reader 1.0.0: `solve.js` answers
-exactly as the reference does on every input — `{columns, rows, errors}` —
-including its broken-row policy (stray CRs, quote junk, unterminated quotes,
-short and long rows), and `main.ts` is the driver the harness runs.
+## How it works
 
-How it gets faster (v2): the hot path has no regex and allocates no object
-per field. The line probe uses cached `indexOf` scans (each delimiter class
-is swept once over the text in C++), clean lines are split in one go,
-unquoted fields scan with a tight `charCodeAt` loop, and quoted fields jump
-from quote to quote with `indexOf`; only multiline / doubled-quote segments
-go through a slow path. The field readers report through shared slots
-instead of a fresh object per field. The driver stringifies each case's
-columns / rows / errors arrays on their own (byte-identical to one
-`JSON.stringify` of the whole answers array, but faster), and it keeps
-TurboFan off (`--no-turbofan`): for a single-shot run, Maglev's quick
-mid-tier code beats paying TurboFan's ~35 ms compile per hot function plus
-its deopt/reopt churn. The careful per-field parser mirrors the reference
-rule for rule, so broken rows come out identical.
+`parser.wasm` (compiled from `transducer.ts` with AssemblyScript,
+`--optimize --enable simd --runtime stub`) works directly on raw
+memory:
 
-## Layout
+1. **JSON scan** — walks the raw `cases.json` bytes, generically skips
+   values, and unescapes each case's `text` (`\" \\ \/ \b \f \n \r \t
+   \uXXXX`, including surrogate pairs) into a byte buffer. Lone
+   surrogates are kept as WTF-8 (`ED A0..BF`) and converted back to
+   `\uXXXX` on output.
+2. **CSV state machine** — a faithful port of `solve.js` on bytes:
+   BOM drop, LF/CRLF record ends, lone-CR drop (`stray_cr`), quoted
+   fields with doubled quotes, CRLF/lone-CR inside quotes read as LF,
+   `quote_junk`, unterminated-quote re-read as unquoted, `short_row` /
+   `long_row` pad/cut. Delimiter scans use 128-bit SIMD masked loads.
+3. **JSON emit** — writes `answers.json` bytes directly with
+   `JSON.stringify`-identical escaping. A per-field flag (set during
+   parsing) lets the emitter skip the escape scan for the ~95% of
+   fields that need none.
 
-- `solve.js` — the reader; `run(input)` returns `{columns, rows, errors}`
-- `main.ts` — reads `/input/cases.json`, answers each case with `run`,
-  writes `/output/answers.json`
-- `LICENSE` — MIT
+`main.ts` copies `/input/cases.json` into WASM memory, calls
+`process()`, and writes the returned bytes to `/output/answers.json`.
+If the WASM path fails, it falls back to `solve.js`.
 
-## Local check
+## Files
 
-On the kit's practice set (6 cases, ~10.5 MB of CSV), the answers match
-csv-reader 1.0.0 exactly on every case, at roughly 2–3× less CPU time than
-the reference on the same machine (measured locally; the graded heat runs
-on the scored set drawn after entries close).
+- `main.ts` — entrypoint (Node 22), drives the WASM transducer.
+- `parser.wasm` — the compiled transducer (12,083 bytes).
+- `transducer.ts` — the AssemblyScript source.
+- `solve.js` — the correct dependency-free JS drop-in for
+  csv-reader 1.0.0 (also the fallback `run({text, header})`).
+
+## Verification (local)
+
+- Practice set: 6/6 cases match the reference, byte-identical across
+  runs, ~53 ms (v2 JS: 1,460 ms on the dev server).
+- Differential fuzz vs csv-reader 1.0.0: 6,000/6,000 random +
+  broken-CSV cases match (unterminated quotes, junk after closing
+  quotes, doubled quotes, embedded CR/LF/CRLF, stray CRs, short/long
+  rows, empty lines, BOM, control chars, non-ASCII, lone surrogates).
